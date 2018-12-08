@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -11,15 +12,26 @@ import (
 	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	"gopkg.in/src-d/go-git.v4/plumbing/storer"
 	"gopkg.in/src-d/go-git.v4/storage/memory"
 )
+
+func hash2str(hash plumbing.Hash) string {
+	return hex.EncodeToString(hash[:])
+}
+
+func str2hash(str string) (plumbing.Hash, error) {
+	var h plumbing.Hash
+	_, err := hex.Decode(h[:], []byte(str))
+	return h, err
+}
 
 type Storage struct {
 	memory.ConfigStorage
 	memory.ObjectStorage
 	//memory.ShallowStorage
 	memory.IndexStorage
-	memory.ReferenceStorage
+	//memory.ReferenceStorage
 	memory.ModuleStorage
 
 	db *sql.DB
@@ -31,14 +43,19 @@ func NewStorage() (*Storage, error) {
 		return nil, err
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS shallow (hash BLOB PRIMARY KEY)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS shallow (hash TEXT PRIMARY KEY)`)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS reference (name TEXT PRIMARY KEY, type TEXT, hash TEXT, target TEXT)`)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Storage{
-		ReferenceStorage: make(memory.ReferenceStorage),
-		ConfigStorage:    memory.ConfigStorage{},
+		//ReferenceStorage: make(memory.ReferenceStorage),
+		ConfigStorage: memory.ConfigStorage{},
 		//ShallowStorage:   memory.ShallowStorage{},
 		ObjectStorage: memory.ObjectStorage{
 			Objects: make(map[plumbing.Hash]plumbing.EncodedObject),
@@ -68,14 +85,14 @@ func (storage *Storage) SetShallow(commits []plumbing.Hash) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare(`INSERT INTO shallow VALUES (?)`)
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO shallow VALUES (?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, c := range commits {
-		_, err = stmt.Exec(hex.EncodeToString(c[:]))
+		_, err = stmt.Exec(hash2str(c))
 		if err != nil {
 			return err
 		}
@@ -91,14 +108,16 @@ func (storage *Storage) Shallow() ([]plumbing.Hash, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var result []plumbing.Hash
 	for rows.Next() {
 		var s string
-		rows.Scan(&s)
+		if err = rows.Scan(&s); err != nil {
+			return nil, err
+		}
 
-		var h plumbing.Hash
-		_, err := hex.Decode(h[:], []byte(s))
+		h, err := str2hash(s)
 		if err != nil {
 			return nil, err
 		}
@@ -107,6 +126,114 @@ func (storage *Storage) Shallow() ([]plumbing.Hash, error) {
 	}
 
 	return result, nil
+}
+
+func (storage *Storage) SetReference(ref *plumbing.Reference) error {
+	typ := "invalid"
+	if ref.Type() == plumbing.HashReference {
+		typ = "hash"
+	} else if ref.Type() == plumbing.SymbolicReference {
+		typ = "symbol"
+	}
+
+	_, err := storage.db.Exec(`INSERT OR REPLACE INTO reference VALUES (?, ?, ?, ?)`, ref.Name().String(), typ, hash2str(ref.Hash()), ref.Target().String())
+	return err
+}
+
+func (storage *Storage) CheckAndSetReference(new_, old *plumbing.Reference) error {
+	if old != nil {
+		ref, err := storage.Reference(old.Name())
+		if err != nil {
+			return err
+		}
+		if ref.Hash() != old.Hash() {
+			return fmt.Errorf("reference has changed concurrently")
+		}
+	}
+	return storage.SetReference(new_)
+}
+
+func (storage *Storage) Reference(name plumbing.ReferenceName) (*plumbing.Reference, error) {
+	rows, err := storage.db.Query(`SELECT * FROM reference WHERE name=?`, name.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ref, err := (*ReferenceIter)(rows).Next()
+	if err == io.EOF {
+		return nil, plumbing.ErrReferenceNotFound
+	}
+
+	return ref, err
+}
+
+type ReferenceIter sql.Rows
+
+func (r *ReferenceIter) Close() {
+	r.Close()
+}
+
+func (r *ReferenceIter) Next() (*plumbing.Reference, error) {
+	if !(*sql.Rows)(r).Next() {
+		return nil, io.EOF
+	}
+
+	var name, typ, hash, target string
+	if err := (*sql.Rows)(r).Scan(&name, &typ, &hash, &target); err != nil {
+		return nil, err
+	}
+
+	if typ == "hash" {
+		h, err := str2hash(hash)
+		if err != nil {
+			return nil, err
+		}
+		return plumbing.NewHashReference(plumbing.ReferenceName(name), h), nil
+	} else if typ == "symbol" {
+		return plumbing.NewSymbolicReference(plumbing.ReferenceName(name), plumbing.ReferenceName(target)), nil
+	} else {
+		return nil, plumbing.ErrInvalidType
+	}
+}
+
+func (r *ReferenceIter) ForEach(cb func(*plumbing.Reference) error) error {
+	for {
+		ref, err := r.Next()
+		if err == io.EOF {
+			return nil
+		}
+
+		if err = cb(ref); err != nil {
+			return err
+		}
+	}
+}
+
+func (storage *Storage) IterReferences() (storer.ReferenceIter, error) {
+	rows, err := storage.db.Query(`SELECT * FROM reference`)
+	return (*ReferenceIter)(rows), err
+}
+
+func (storage *Storage) RemoveReference(name plumbing.ReferenceName) error {
+	_, err := storage.db.Exec(`DELETE FROM reference WHERE name=?`, name.String())
+	return err
+}
+
+func (storage *Storage) CountLooseRefs() (int, error) {
+	row := storage.db.QueryRow(`SELECT COUNT(name) FROM reference`)
+	if row == nil {
+		return 0, fmt.Errorf("something wrong")
+	}
+	var i int
+	if err := row.Scan(&i); err != nil {
+		return 0, err
+	}
+	return i, nil
+}
+
+func (storage *Storage) PackRefs() error {
+	return nil
 }
 
 func main() {
@@ -119,8 +246,8 @@ func main() {
 
 	fmt.Println("clone")
 	repo, err := git.Clone(storage, fs, &git.CloneOptions{
-		//URL:      "https://github.com/macrat/updns",
-		URL:      "https://github.com/torvalds/linux",
+		URL: "https://github.com/macrat/updns",
+		//URL:      "https://github.com/torvalds/linux",
 		Depth:    1,
 		Progress: os.Stdout,
 	})
@@ -135,6 +262,7 @@ func main() {
 	}
 
 	fmt.Println("print")
+	fmt.Println("=====")
 	err = commits.ForEach(func(c *object.Commit) error {
 		fmt.Println(c.Message)
 		return nil
