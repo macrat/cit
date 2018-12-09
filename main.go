@@ -13,6 +13,7 @@ import (
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 	"gopkg.in/src-d/go-git.v4/plumbing/storer"
+	"gopkg.in/src-d/go-git.v4/storage"
 	"gopkg.in/src-d/go-git.v4/storage/memory"
 )
 
@@ -32,9 +33,10 @@ type Storage struct {
 	//memory.ShallowStorage
 	memory.IndexStorage
 	//memory.ReferenceStorage
-	memory.ModuleStorage
+	//memory.ModuleStorage
 
-	db *sql.DB
+	module string
+	db     *sql.DB
 }
 
 func NewStorage() (*Storage, error) {
@@ -43,16 +45,20 @@ func NewStorage() (*Storage, error) {
 		return nil, err
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS shallow (hash TEXT PRIMARY KEY)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS shallow (module TEXT, hash TEXT, PRIMARY KEY (module, hash))`)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS reference (name TEXT PRIMARY KEY, type TEXT, hash TEXT, target TEXT)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS reference (module TEXT, name TEXT, type TEXT, hash TEXT, target TEXT, PRIMARY KEY(module, name))`)
 	if err != nil {
 		return nil, err
 	}
 
+	return NewModuleStorage(db, "")
+}
+
+func NewModuleStorage(db *sql.DB, module string) (*Storage, error) {
 	return &Storage{
 		//ReferenceStorage: make(memory.ReferenceStorage),
 		ConfigStorage: memory.ConfigStorage{},
@@ -64,35 +70,36 @@ func NewStorage() (*Storage, error) {
 			Blobs:   make(map[plumbing.Hash]plumbing.EncodedObject),
 			Tags:    make(map[plumbing.Hash]plumbing.EncodedObject),
 		},
-		ModuleStorage: make(memory.ModuleStorage),
+		//ModuleStorage: make(memory.ModuleStorage),
+		module:        module,
 		db:            db,
 	}, nil
 }
 
-func (storage *Storage) Close() error {
-	return storage.db.Close()
+func (s *Storage) Close() error {
+	return s.db.Close()
 }
 
-func (storage *Storage) SetShallow(commits []plumbing.Hash) error {
-	tx, err := storage.db.Begin()
+func (s *Storage) SetShallow(commits []plumbing.Hash) error {
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec(`DELETE FROM shallow`)
+	_, err = tx.Exec(`DELETE FROM shallow WHERE module=?`, s.module)
 	if err != nil {
 		return err
 	}
 
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO shallow VALUES (?)`)
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO shallow (module, hash) VALUES (?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, c := range commits {
-		_, err = stmt.Exec(hash2str(c))
+		_, err = stmt.Exec(s.module, hash2str(c))
 		if err != nil {
 			return err
 		}
@@ -103,8 +110,8 @@ func (storage *Storage) SetShallow(commits []plumbing.Hash) error {
 	return nil
 }
 
-func (storage *Storage) Shallow() ([]plumbing.Hash, error) {
-	rows, err := storage.db.Query(`SELECT * FROM shallow`)
+func (s *Storage) Shallow() ([]plumbing.Hash, error) {
+	rows, err := s.db.Query(`SELECT hash FROM shallow WHERE module=?`, s.module)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +135,7 @@ func (storage *Storage) Shallow() ([]plumbing.Hash, error) {
 	return result, nil
 }
 
-func (storage *Storage) SetReference(ref *plumbing.Reference) error {
+func (s *Storage) SetReference(ref *plumbing.Reference) error {
 	typ := "invalid"
 	if ref.Type() == plumbing.HashReference {
 		typ = "hash"
@@ -136,13 +143,13 @@ func (storage *Storage) SetReference(ref *plumbing.Reference) error {
 		typ = "symbol"
 	}
 
-	_, err := storage.db.Exec(`INSERT OR REPLACE INTO reference VALUES (?, ?, ?, ?)`, ref.Name().String(), typ, hash2str(ref.Hash()), ref.Target().String())
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO reference (module, name, type, hash, target) VALUES (?, ?, ?, ?, ?)`, s.module, ref.Name().String(), typ, hash2str(ref.Hash()), ref.Target().String())
 	return err
 }
 
-func (storage *Storage) CheckAndSetReference(new_, old *plumbing.Reference) error {
+func (s *Storage) CheckAndSetReference(new_, old *plumbing.Reference) error {
 	if old != nil {
-		ref, err := storage.Reference(old.Name())
+		ref, err := s.Reference(old.Name())
 		if err != nil {
 			return err
 		}
@@ -150,11 +157,11 @@ func (storage *Storage) CheckAndSetReference(new_, old *plumbing.Reference) erro
 			return fmt.Errorf("reference has changed concurrently")
 		}
 	}
-	return storage.SetReference(new_)
+	return s.SetReference(new_)
 }
 
-func (storage *Storage) Reference(name plumbing.ReferenceName) (*plumbing.Reference, error) {
-	rows, err := storage.db.Query(`SELECT * FROM reference WHERE name=?`, name.String())
+func (s *Storage) Reference(name plumbing.ReferenceName) (*plumbing.Reference, error) {
+	rows, err := s.db.Query(`SELECT name, type, hash, target FROM reference WHERE module=? AND name=?`, s.module, name.String())
 	if err != nil {
 		return nil, err
 	}
@@ -210,18 +217,18 @@ func (r *ReferenceIter) ForEach(cb func(*plumbing.Reference) error) error {
 	}
 }
 
-func (storage *Storage) IterReferences() (storer.ReferenceIter, error) {
-	rows, err := storage.db.Query(`SELECT * FROM reference`)
+func (s *Storage) IterReferences() (storer.ReferenceIter, error) {
+	rows, err := s.db.Query(`SELECT name, type, hash, target FROM reference WHERE module=?`, s.module)
 	return (*ReferenceIter)(rows), err
 }
 
-func (storage *Storage) RemoveReference(name plumbing.ReferenceName) error {
-	_, err := storage.db.Exec(`DELETE FROM reference WHERE name=?`, name.String())
+func (s *Storage) RemoveReference(name plumbing.ReferenceName) error {
+	_, err := s.db.Exec(`DELETE FROM reference WHERE module=? AND name=?`, s.module, name.String())
 	return err
 }
 
-func (storage *Storage) CountLooseRefs() (int, error) {
-	row := storage.db.QueryRow(`SELECT COUNT(name) FROM reference`)
+func (s *Storage) CountLooseRefs() (int, error) {
+	row := s.db.QueryRow(`SELECT COUNT(name) FROM reference WHERE module=?`, s.module)
 	if row == nil {
 		return 0, fmt.Errorf("something wrong")
 	}
@@ -232,8 +239,12 @@ func (storage *Storage) CountLooseRefs() (int, error) {
 	return i, nil
 }
 
-func (storage *Storage) PackRefs() error {
+func (s *Storage) PackRefs() error {
 	return nil
+}
+
+func (s *Storage) Module(name string) (storage.Storer, error) {
+	return NewModuleStorage(s.db, name);
 }
 
 func main() {
